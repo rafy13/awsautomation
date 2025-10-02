@@ -356,6 +356,23 @@ class TasksManager:
             if redis_client.sismember(TASK_RUNNING_SET, task_key) == 0:
                 return task_id
         return None
+
+    def get_task_status(self, task_id):
+        execution_arn = self.get_task_execution_arn(task_id)
+        try:
+            desc = datasync.describe_task_execution(TaskExecutionArn=execution_arn)
+            status = desc['Status']
+            files_transferred = desc.get('FilesTransferred', 0)
+            bytes_transferred = desc.get('BytesTransferred', 0)
+
+            return {
+                "status": status,
+                "files_transferred": files_transferred,
+                "bytes_transferred": bytes_transferred
+            }
+        except Exception as e:
+            logging.error(f"Failed to get task status for task {task_id}: {e}")
+            return {"status": "ERROR", "files_transferred": 0, "bytes_transferred": 0}
     
     def acquire_task(self, task_id):
         redis_client.sadd(TASK_RUNNING_SET, f"{task_id}")
@@ -381,8 +398,11 @@ class Datasync:
         end = time.time() + acquire_timeout
         while time.time() < end:
             if redis_client.set(lock_key, value, ex=lock_timeout, nx=True):
-                return value
+                return True
             time.sleep(4)
+        current_value = redis_client.get(lock_key)
+        current_value = current_value.decode("utf-8") if current_value else None
+        logging.error(f"Failed to acquire lock for {lockname}. Current value: {current_value}")
         return False
 
     def release_lock(self, lockname, value):
@@ -401,6 +421,11 @@ class Datasync:
             pipe.unwatch()
         except Exception:
             return False
+
+    def get_lock_value(self, key):
+        lock_key = LOCK_KEY_PREFIX + key
+        value = redis_client.get(lock_key)
+        return value.decode("utf-8") if value else None
 
     def acquire_lock_on_instance(self, instance, value):
         instance_id = instance.get("id")
@@ -432,6 +457,14 @@ class Datasync:
                     f"Released lock for the instance.",
                 )
         return False
+    
+    def get_task_lock_value(self, task_id):
+        key = f"{TASK_KEY_PREFIX}{task_id}"
+        return self.get_lock_value(key)
+
+    def get_instance_lock_value(self, instance_id):
+        key = f"{INSTANCE_KEY_PREFIX}{instance_id}"
+        return self.get_lock_value(key)
 
     def get_instance(self, instance_id):
         instance = self._instances.get(instance_id)
@@ -469,8 +502,9 @@ class Datasync:
         execution_arn = self.tasks_manager.start_task_execution(task_id, instance_id)
         self.log_instance_datasync_event(
                 instance_id,
-                f"Started task execution for '{instance_id}': {execution_arn}",
+                f"Started task execution: {execution_arn}",
             )
+        logging.info(f"Started task execution for '{instance_id}': {execution_arn}")
         return execution_arn
 
     def datasync_worker(self):
@@ -480,9 +514,8 @@ class Datasync:
             try:
                 task_id = self.tasks_manager.get_free_task()
                 if task_id is None:
-                    redis_client.rpush(QUEUE_NAME, instance_id)
                     logging.info(
-                        f"No free tasks found. Pushed instance back to queue."
+                        f"No free tasks found."
                     )
                     time.sleep(10)
                     continue
@@ -532,6 +565,7 @@ class Datasync:
             instance_id = int(instance_id.decode("utf-8"))
             with open(failed_instances_file, "a") as file:
                 file.write(f"{instance_id}\n")
+                logging.info(f"Datasync failed: {instance_id}")
     
     def monitor_finished_datasync(self):
         while True:
@@ -541,19 +575,7 @@ class Datasync:
             instance_id = int(instance_id.decode("utf-8"))
             with open(completed_instances_file, "a") as file:
                 file.write(f"{instance_id}\n")
-
-    def get_task_status(self, task_id):
-        execution_arn = self.tasks_manager.get_task_execution_arn(task_id)
-        desc = datasync.describe_task_execution(TaskExecutionArn=execution_arn)
-        status = desc['Status']
-        files_transferred = desc.get('FilesTransferred', 0)
-        bytes_transferred = desc.get('BytesTransferred', 0)
-
-        return {
-            "status": status,
-            "files_transferred": files_transferred,
-            "bytes_transferred": bytes_transferred
-        }
+                logging.info(f"Datasync completed: {instance_id}")
 
     def monitor_running_datasyncs(self):
         running_set = [
@@ -563,15 +585,15 @@ class Datasync:
         running_instances = []
         with open(running_instances_file, "w") as file:
             for instance_id in running_set:
-                task_status = self.get_task_status(instance_id)
+                task_id = self.get_instance_lock_value(instance_id)
+                task_status = self.tasks_manager.get_task_status(task_id)
                 if task_status['status'] not in ['SUCCESS', 'ERROR', 'CANCELED']:
                     file.write(f"ID: {instance_id}, FilesTransferred: {task_status['files_transferred']}, BytesTransferred: {task_status['bytes_transferred']}\n")
                     running_instances.append(instance_id)
                     continue
                 
                 instance_key = f"{INSTANCE_KEY_PREFIX}{instance_id}"
-                task_id = redis_client.get(instance_key)
-                task_id = task_id.decode("utf-8") if task_id else None
+                logging.info(f"Instance key: {instance_key}, Task ID: {task_id}")
                 if task_status['status'] == 'SUCCESS':
                     redis_client.srem(RUNNING_SET, instance_id)
                     redis_client.rpush(COMPLETED_INSTANCES_QUEUE, instance_id)
@@ -594,7 +616,8 @@ class Datasync:
         logging.info(f"Currently datasync running for: {running_instances}")
 
     def monitor_bulk_datasync(self):
-        while not self.datasync_config.get_stop_flag() == 0:
+        logging.info("Monitoring datasyncs")
+        while self.datasync_config.get_stop_flag() == 0:
             try:
                 self.monitor_failed_datasyncs()
                 self.monitor_running_datasyncs()
@@ -602,7 +625,7 @@ class Datasync:
             except Exception as e:
                 logging.error(e, exc_info=e)
             finally:
-                time.sleep(300)
+                time.sleep(30)
 
     def run(self):
         monitor_thread = threading.Thread(target=self.monitor_bulk_datasync)

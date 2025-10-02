@@ -1,0 +1,5 @@
+{
+    "stop_datasync": 0,
+    "queue_name": "stagig_datasync_instances_staging",
+    "tasks_count": 1
+}
